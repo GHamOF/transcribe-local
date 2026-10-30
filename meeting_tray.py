@@ -16,7 +16,8 @@ Run it with pythonw.exe so there's no console window:
 
 Deps: pip install soundcard numpy requests pystray pillow   (tkinter ships with Python)
 """
-import os, sys, time, threading, queue
+import os, sys, time, threading, queue, json
+from datetime import datetime, timedelta
 
 if sys.platform == "darwin":          # the macOS menu-bar app is its own module
     import runpy
@@ -40,8 +41,8 @@ except Exception:
 # --- single instance: a named mutex. (Was a localhost port bind, but Windows
 #     reserves random port ranges for Hyper-V/Docker at boot; when 49731 landed in
 #     one the bind failed and the tray silently exited as if already running.)
-import ctypes
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+import ctypes, ctypes.wintypes
+_k32 =ctypes.WinDLL("kernel32", use_last_error=True)
 _k32.CreateMutexW.restype = ctypes.c_void_p
 _guard = _k32.CreateMutexW(None, False, "Local\\MeetingRecorderTray")
 if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
@@ -65,12 +66,41 @@ import meeting_recorder as mr
 
 # ---------------------------------------------------------------- shared state
 state = {"recording": False, "stop_event": None, "rec_thread": None, "wav": None,
-         "started": 0.0, "started_wall": 0.0, "busy": 0, "status": "",   # busy = transcriptions running
-         "quitting": False}
+         "started": 0.0, "started_wall": 0.0, "busy": 0, "status": "",   # busy = transcriptions/warm-ups running
+         "quitting": False,
+         "warm_until": None,   # a warm-up nobody records after is stopped at this (aware) time
+         "restart": False}     # start a new recording as soon as this one has stopped
 lock = threading.Lock()
 ui_q = queue.Queue()          # tray thread -> tk main thread requests
 icon = None
 root = None
+
+# Optional features, toggled from the tray menu and kept across restarts.
+SETTINGS_FILE = os.path.join(_HERE, "tray-settings.json")
+settings = {"calendar_prompt": False, "call_prompt": False, "end_prompt": False,
+            "mic_ignore": []}   # mic_users() keys silenced with "Never for …"
+# The call the current recording belongs to, as mic sessions (see recording_tick).
+# asked: None, "switch"/"ended" while that prompt is open, "kept" after "Keep
+# recording" on a call that ended (no asking again until it comes back).
+rec_watch = {"id": None, "known": set(), "active": 0.0, "asked": None, "pending": set()}
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            settings.update({k: v for k, v in json.load(f).items() if k in settings})
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"settings: could not read {SETTINGS_FILE}: {type(e).__name__}: {e}")
+
+
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as e:
+        print(f"settings: could not write {SETTINGS_FILE}: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------- tray icon art
@@ -144,8 +174,43 @@ def refresh_icon():
         print(f"refresh_icon: {type(e).__name__}: {e}")
 
 
+def hide_from_capture(win):
+    """Keep a window out of screen shares and screenshots: Teams, Zoom, browsers,
+    OBS and the Snipping Tool all capture through APIs that honour this, and show
+    what's behind it instead. Our dialogs can pop up mid-meeting (a prompt, or a
+    transcript finishing). Call it right after creating the window.
+
+    Tk only creates the real top-level window when it's first shown, and
+    recreates it on some style changes, so it's applied on <Map>; until then the
+    window is fully transparent, so not a single frame can be captured."""
+    def on_map(e):
+        if e.widget is not win:
+            return                            # the binding fires for child widgets too
+        try:
+            u32 = ctypes.windll.user32
+            u32.SetWindowDisplayAffinity.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.DWORD]
+            hwnd = int(win.wm_frame(), 16)    # the real top-level window, not tk's inner one
+            if not u32.SetWindowDisplayAffinity(hwnd, 0x11):      # WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+)
+                if not u32.SetWindowDisplayAffinity(hwnd, 0x01):  # WDA_MONITOR: a black box, at least
+                    print("hide_from_capture: failed, window stays invisible")
+                    return
+                print("hide_from_capture: excluding failed, window shows as black in captures")
+        except Exception as e:
+            print(f"hide_from_capture: {type(e).__name__}: {e}")
+            return
+        win.attributes("-alpha", 1.0)
+
+    win.attributes("-alpha", 0.0)
+    win.bind("<Map>", on_map, add="+")
+
+
 def notify(title, msg):
+    """A tray balloon. Windows draws these itself, so unlike our dialogs they'd
+    show in a screen share: skipped while an app has the mic (a call, most likely).
+    Every balloon duplicates a dialog or the icon's colour, so nothing is lost."""
     try:
+        if mic_users():
+            return
         icon.notify(msg, title)
     except Exception:
         pass
@@ -176,14 +241,20 @@ def record_thread_main(wav, ev):
     except Exception as e:
         with lock:
             state["recording"] = False
+            restart, state["restart"] = state["restart"], False
         refresh_icon()
+        if restart and not state["quitting"]:
+            start_recording()
         ui_q.put(("result", {"ok": False, "title": "Recording crashed",
                              "body": f"{type(e).__name__}: {e}\n\nAudio may be incomplete:\n{wav}"}))
         return
     with lock:
         state["recording"] = False
+        restart, state["restart"] = state["restart"], False
     refresh_icon()
     if not state["quitting"]:
+        if restart:                       # "Stop and record the new call": no gap before the next one
+            start_recording()
         ui_q.put(("ask", {"wav": wav_, "secs": secs, "peak_mic": peak_mic, "peak_sys": peak_sys}))
 
 
@@ -201,6 +272,7 @@ def show_result(ok, title, body, folder=None):
     """A visible, guaranteed outcome dialog (tray balloons are unreliable here).
     Success auto-closes after 15 s; failures stay until dismissed."""
     win = tk.Toplevel(root)
+    hide_from_capture(win)
     win.title(title)
     win.resizable(False, False)
     win.attributes("-topmost", True)
@@ -239,6 +311,7 @@ def show_transcribe_dialog(wav, secs=None, peak_mic=None, peak_sys=None):
         return
 
     win = tk.Toplevel(root)
+    hide_from_capture(win)
     win.title("Transcribe recording")
     win.resizable(False, False)
     win.attributes("-topmost", True)
@@ -366,6 +439,7 @@ def show_name_dialog(txt, then=None, title="", new=False):
         finish(False); return
 
     win = tk.Toplevel(root)
+    hide_from_capture(win)
     win.title("Who is who?")
     win.attributes("-topmost", True)
     win.columnconfigure(0, weight=1)
@@ -498,6 +572,389 @@ def pick_transcript_to_name():
             show_name_dialog(path, title=mr.title_from_txt(path))
 
 
+# ---------------------------------------------------------------- meeting prompts
+# All off by default (tray menu → Meeting prompts…). The calendar one offers to
+# warm the server up WARMUP_LEAD before a meeting; it learns of meetings from
+# the new Outlook's reminder notifications (it has no API to ask). The mic one
+# offers to record when an app opens the mic: a call answered, a meeting's join
+# screen. Apps can be silenced from the prompt ("Never for …"). The end one,
+# while recording, asks what to do when the call ends or another one starts.
+WATCH_EVERY = 60             # s between checks, for all
+CALL_GAP = 150               # s an app must leave the mic closed (two checks in a row) before its call counts as over
+# Audio routers open the real mic whenever any app uses their virtual one, so
+# they'd be named instead of the app that's actually in the call.
+MIC_ROUTERS = ("steelseriessonar", "nvidia broadcast", "voicemeeter", "krisp")
+WARMUP_LEAD = 120            # s before a meeting to offer the warm-up
+KEEP_REMINDERS = timedelta(hours=6)
+LATE_OFFER = timedelta(minutes=5)    # still offer it this long after the start (a late reminder)
+MEETING_LENGTH = timedelta(hours=1)  # reminders carry no end time
+WARM_GRACE = timedelta(minutes=10)   # after the meeting's end, before an unused warm-up is stopped
+_MIC_STORE = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+_WPN_DB = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Notifications", "wpndatabase.db")
+
+
+def outlook_reminders():
+    """(start, title) of the meetings the new Outlook has shown a reminder for,
+    read from Windows' notification store. A reminder leaves the store once
+    dismissed, so callers keep their own copy."""
+    import sqlite3, pathlib, urllib.parse, xml.etree.ElementTree as ET
+    db = sqlite3.connect(pathlib.Path(_WPN_DB).as_uri() + "?mode=ro", uri=True, timeout=5)
+    try:
+        rows = db.execute("select n.Payload from Notification n join NotificationHandler h"
+                          " on n.HandlerId = h.RecordId where n.Type = 'toast'"
+                          " and h.PrimaryId like 'Microsoft.OutlookForWindows%'").fetchall()
+    finally:
+        db.close()
+    out = []
+    for (payload,) in rows:
+        try:
+            toast = ET.fromstring(payload.decode("utf-8") if isinstance(payload, bytes) else payload)
+            launch = urllib.parse.parse_qs(toast.get("launch", ""))
+            if launch.get("notificationType") != ["EventReminder"]:
+                continue
+            start = datetime.fromisoformat(json.loads(launch["itemId"][0])["meetingTime"].replace("Z", "+00:00"))
+            title = (toast.findtext(".//text") or "").strip() or "Meeting"
+            out.append((start.astimezone(), title))
+        except Exception:
+            continue                         # some other toast shape; not a meeting we can read
+    return out
+
+
+def mic_users():
+    """The apps holding the microphone right now, minus this tray itself, audio
+    routers and the ones silenced with "Never for …": what Windows' own mic-in-use indicator
+    reads. {key: session}: the key is the consent-store key name, a package name for store apps
+    (MSTeams_8wekyb3d8bbwe) or an exe path with # for \\ for the rest; an app's
+    LastUsedTimeStop is 0 while it has the mic open. The session is its
+    LastUsedTimeStart, which changes each time the app reopens the mic, so a call
+    switch shows even when it falls between two checks."""
+    import winreg
+    skip = {sys.executable.replace("\\", "#").lower()} | {a.lower() for a in settings["mic_ignore"]}
+    users = {}
+    for path in (_MIC_STORE, _MIC_STORE + r"\NonPackaged"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as k:
+                for i in range(winreg.QueryInfoKey(k)[0]):
+                    name = winreg.EnumKey(k, i)
+                    low = name.lower()
+                    if low == "nonpackaged" or low in skip or any(r in low for r in MIC_ROUTERS):
+                        continue
+                    try:
+                        with winreg.OpenKey(k, name) as app:
+                            if winreg.QueryValueEx(app, "LastUsedTimeStop")[0] == 0:
+                                users[name] = winreg.QueryValueEx(app, "LastUsedTimeStart")[0]
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return users
+
+
+def app_name(key):
+    """A readable name for a mic_users() key: the exe's name, or the package's."""
+    if "#" in key:
+        return os.path.splitext(key.rsplit("#", 1)[-1])[0]
+    return key.split("_")[0].removeprefix("Microsoft.")
+
+
+def show_prompt(title, body, buttons, timeout, on_dismiss=None):
+    """A question in the bottom-right corner, like a notification: it doesn't
+    grab focus from the call. buttons = [(label, action)]; the last is the
+    default (Enter), an action of None just closes it. Esc, the close box and
+    the `timeout` (s) run on_dismiss."""
+    win = tk.Toplevel(root)
+    hide_from_capture(win)
+    win.title(title)
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+    tk.Label(win, text=title, font=("Segoe UI", 11, "bold")).grid(
+        row=0, column=0, sticky="w", padx=16, pady=(14, 0))
+    tk.Label(win, text=body, justify="left", foreground="#333").grid(
+        row=1, column=0, sticky="w", padx=16, pady=(2, 10))
+
+    def dismiss():
+        if win.winfo_exists():
+            win.destroy()
+            if on_dismiss:
+                on_dismiss()
+
+    def press(action):
+        if action is None:
+            return dismiss()
+        win.destroy()
+        action()
+
+    btns = ttk.Frame(win)
+    btns.grid(row=2, column=0, sticky="e", padx=16, pady=(0, 14))
+    for label, action in buttons:
+        ttk.Button(btns, text=label, command=lambda a=action: press(a)).pack(side="left", padx=4)
+    win.bind("<Return>", lambda e: press(buttons[-1][1]))
+    win.bind("<Escape>", lambda e: dismiss())
+    win.protocol("WM_DELETE_WINDOW", dismiss)
+    win.update_idletasks()
+    area = ctypes.wintypes.RECT()          # the desktop minus the taskbar
+    if not ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(area), 0):   # SPI_GETWORKAREA
+        area.right, area.bottom = win.winfo_screenwidth(), win.winfo_screenheight() - 48
+    win.geometry(f"+{area.right - win.winfo_width() - 16}+{area.bottom - win.winfo_height() - 16}")
+    win.after(timeout * 1000, dismiss)
+
+
+def show_warm_prompt(title, start, end):
+    def go():
+        with lock:
+            state["warm_until"] = end + WARM_GRACE
+        threading.Thread(target=warm_worker, daemon=True).start()
+    verb = "starts" if start > datetime.now().astimezone() else "started"
+    show_prompt("Meeting starting soon", f"“{title}” {verb} at {start:%H:%M}.\n"
+                "Warm up the transcription server now, so the transcript\n"
+                "doesn't have to wait for it afterwards?",
+                [("Not now", None), ("Warm up", go)],
+                timeout=max(60, int((start - datetime.now().astimezone()).total_seconds())))
+
+
+def show_call_prompt(app):
+    def never():
+        settings["mic_ignore"].append(app)
+        save_settings()
+    name = app_name(app)
+    show_prompt("Microphone in use", f"{name} is using your microphone.\nStart recording?",
+                [(f"Never for {name}", never), ("Not now", None),
+                 ("Record", lambda: None if state["recording"] else start_recording())], timeout=120)
+
+
+_settings_win = None
+
+
+def show_settings_dialog():
+    """The meeting prompts as checkboxes in a window that stays open (a tray
+    menu closes on every click). Each change is saved straight away."""
+    global _settings_win
+    if _settings_win is not None and _settings_win.winfo_exists():
+        _settings_win.deiconify()
+        _settings_win.lift()
+        _settings_win.focus_force()
+        return
+    win = _settings_win = tk.Toplevel(root)
+    hide_from_capture(win)
+    win.title("Meeting prompts")
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+    ttk.Label(win, text="Meeting prompts", font=("Segoe UI", 10, "bold")).grid(
+        row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 4))
+
+    options = [
+        ("calendar_prompt", "Offer to warm up the server before meetings",
+         "About 2 minutes ahead, from Outlook's meeting reminders."),
+        ("call_prompt", "Offer to record when an app starts using the mic",
+         "Teams, Zoom, a browser call: when you answer or join."),
+        ("end_prompt", "Offer to stop when the call ends or changes",
+         "While recording: the call ended, or you switched to another one."),
+    ]
+    for n, (key, label, hint) in enumerate(options):
+        var = tk.BooleanVar(value=settings[key])
+
+        def toggle(key=key, var=var):
+            settings[key] = var.get()
+            save_settings()
+
+        ttk.Checkbutton(win, text=label, variable=var, command=toggle).grid(
+            row=1 + 2 * n, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+        ttk.Label(win, text=hint, foreground="#666").grid(
+            row=2 + 2 * n, column=0, columnspan=2, sticky="w", padx=(34, 12))
+
+    silenced = ttk.Label(win, foreground="#666")
+    silenced.grid(row=7, column=0, sticky="w", padx=12, pady=(12, 0))
+    unsilence = ttk.Button(win, text="Ask again")
+    unsilence.grid(row=7, column=1, sticky="e", padx=12, pady=(12, 0))
+
+    def show_silenced():
+        names = ", ".join(app_name(a) for a in settings["mic_ignore"])
+        silenced.configure(text=f"Silenced apps: {names}" if names else "No silenced apps.")
+        unsilence.configure(state="normal" if names else "disabled")
+
+    def ask_again():
+        settings["mic_ignore"].clear()
+        save_settings()
+        show_silenced()
+
+    unsilence.configure(command=ask_again)
+    show_silenced()
+    ttk.Button(win, text="Close", command=win.destroy).grid(
+        row=8, column=1, sticky="e", padx=12, pady=(12, 12))
+    win.bind("<Escape>", lambda e: win.destroy())
+    win.update_idletasks()
+    w, h = win.winfo_width(), win.winfo_height()
+    win.geometry(f"+{(win.winfo_screenwidth() - w) // 2}+{(win.winfo_screenheight() - h) // 3}")
+    win.focus_force()
+
+
+def show_end_prompt(kind, rec_id, old, new):
+    """While recording: the call seems over ("ended"), or over with another one
+    started ("switch"). Ignoring it keeps recording; nothing stops on its own."""
+    def keep():
+        with lock:
+            if rec_watch["id"] == rec_id:
+                if kind == "switch":             # the new call belongs to this recording too
+                    rec_watch["known"] |= rec_watch["pending"]
+                rec_watch.update(asked="kept" if kind == "ended" else None,
+                                 pending=set(), active=time.monotonic())
+
+    def ours():
+        return state["recording"] and state["started"] == rec_id
+
+    def stop():
+        keep()                                   # settles the watch state; the recording ends anyway
+        if ours():
+            stop_recording()
+
+    def restart():
+        keep()
+        if ours():
+            state["restart"] = True              # record_thread_main starts the next one
+            stop_recording()
+        elif not state["recording"]:
+            start_recording()
+
+    if kind == "switch":
+        what = (f"{old} closed the microphone and opened it again." if old == new
+                else f"{old} stopped using the microphone and {new} started.")
+        show_prompt("New call?", f"{what}\nLooks like you switched calls. What should happen to the recording?",
+                    [("Keep recording", keep), ("Stop", stop), ("Stop and record the new call", restart)],
+                    timeout=300, on_dismiss=keep)
+    else:
+        show_prompt("Call ended?", f"{old} stopped using the microphone.\nStop the recording?",
+                    [("Keep recording", keep), ("Stop recording", stop)],
+                    timeout=300, on_dismiss=keep)
+
+
+def warm_worker():
+    def progress(msg):
+        print(msg)
+        state["status"] = (str(msg).strip().splitlines() or [""])[0]   # tooltip and menu: one line
+        refresh_icon()
+
+    with lock:
+        state["busy"] += 1
+    refresh_icon()
+    try:
+        mr.warm_up_server(progress)
+        notify("Transcription server ready", "It stays up for the meeting, and stops after the transcript.")
+    except Exception as e:
+        with lock:
+            state["warm_until"] = None
+        ui_q.put(("result", {"ok": False, "title": "Could not warm up the server",
+                             "body": f"{type(e).__name__}: {e}"}))
+    finally:
+        with lock:
+            state["busy"] -= 1
+            if not state["busy"]:
+                state["status"] = ""
+        refresh_icon()
+
+
+def watch_main():
+    """Background loop behind the meeting prompts; asks the tk thread to show them."""
+    cal = {"reminders": {}, "error": None}     # reminders: start -> title
+    asked = set()                    # meeting starts already offered a warm-up
+    seen = {}                        # mic_users() key -> last time it had the mic
+    while True:
+        try:
+            now = time.monotonic()
+            users = mic_users()
+            new = sorted(u for u in users if u not in seen or now - seen[u] >= CALL_GAP)
+            seen.update(dict.fromkeys(users, now))
+            if settings["call_prompt"] and new and not state["recording"]:
+                ui_q.put(("call_ask", {"app": new[0]}))
+            recording_tick(users)
+            calendar_tick(cal, asked)
+            release_tick(meeting_on=bool(users))
+        except Exception as e:
+            print(f"watch: {type(e).__name__}: {e}")
+        time.sleep(WATCH_EVERY)
+
+
+def recording_tick(users):
+    """While recording, watch the mic sessions of the call being recorded: all
+    gone for CALL_GAP → "call ended?"; all gone with a new one open → "new call?".
+    A recording started outside a call adopts the first call that comes along;
+    an app joining alongside the call just becomes part of it."""
+    with lock:
+        if not (settings["end_prompt"] and state["recording"]):
+            rec_watch["id"] = None
+            return
+        now, sessions = time.monotonic(), set(users.items())
+        if rec_watch["id"] != state["started"]:  # a new recording
+            rec_watch.update(id=state["started"], known=sessions, active=now, asked=None, pending=set())
+            return
+        known = rec_watch["known"]
+        if sessions & known:
+            rec_watch["active"] = now
+            if rec_watch["asked"] == "kept":
+                rec_watch["asked"] = None
+        if rec_watch["asked"] in ("switch", "ended"):
+            return                               # a prompt is open; its answer decides
+        new = sessions - known
+        if new and (not known or sessions & known):
+            known |= new                         # first call of the recording, or someone joined alongside
+            rec_watch["active"] = now
+        elif new:
+            rec_watch.update(asked="switch", pending=new)
+            ui_q.put(("end_ask", {"kind": "switch", "rec_id": rec_watch["id"],
+                                  "old": _names(known), "new": _names(new)}))
+        elif known and not sessions and rec_watch["asked"] is None and now - rec_watch["active"] >= CALL_GAP:
+            rec_watch["asked"] = "ended"
+            ui_q.put(("end_ask", {"kind": "ended", "rec_id": rec_watch["id"],
+                                  "old": _names(known), "new": ""}))
+
+
+def _names(sessions):
+    return " and ".join(sorted({app_name(app) for app, _ in sessions}))
+
+
+def calendar_tick(cal, asked):
+    if not settings["calendar_prompt"]:
+        return
+    now = datetime.now().astimezone()
+    try:
+        for start, title in outlook_reminders():
+            cal["reminders"].setdefault(start, title)
+        cal["error"] = None
+    except Exception as e:
+        if cal["error"] is None:             # say it once, not every check
+            print(f"outlook reminders: {type(e).__name__}: {e}")
+        cal["error"] = e
+    for start in [s for s in cal["reminders"] if s < now - KEEP_REMINDERS]:
+        del cal["reminders"][start]
+    for start, title in sorted(cal["reminders"].items()):
+        # keyed on the start time: two meetings at once need only one warm-up
+        if start in asked or not -LATE_OFFER < start - now <= timedelta(seconds=WARMUP_LEAD):
+            continue
+        asked.add(start)
+        end = start + MEETING_LENGTH
+        if state["recording"]:
+            continue
+        if mr.server_healthy():
+            with lock:                       # back-to-back meetings: keep a warm-up alive for this one too
+                if state["warm_until"]:
+                    state["warm_until"] = max(state["warm_until"], end + WARM_GRACE)
+            continue
+        ui_q.put(("warm_ask", {"title": title, "start": start, "end": end}))
+
+
+def release_tick(meeting_on):
+    """Stop a warm-up whose meeting is over without anything being recorded.
+    meeting_on (an app still has the mic) means it ran past its assumed end:
+    keep waiting."""
+    with lock:
+        until = state["warm_until"]
+        if (not until or datetime.now().astimezone() < until or meeting_on
+                or state["recording"] or state["busy"]):
+            return
+        state["warm_until"] = None
+    if mr.release_idle_server(print):
+        print("warm-up went unused — server stopped")
+
+
 # ---------------------------------------------------------------- tray menu
 def on_toggle(icon_, item):
     if state["recording"]:
@@ -520,6 +977,10 @@ def on_open_folder(icon_, item):
         os.startfile(mr.OUTPUT_DIR)
     except Exception as e:
         print(f"open folder: {type(e).__name__}: {e}")
+
+
+def on_settings(icon_, item):
+    ui_q.put(("settings", {}))
 
 
 def on_quit(icon_, item):
@@ -564,6 +1025,7 @@ def build_menu():
         pystray.MenuItem("Transcribe an existing recording…", on_pick_file),
         pystray.MenuItem("Name speakers in a transcript…", on_name_file),
         pystray.MenuItem("Open transcripts folder", on_open_folder),
+        pystray.MenuItem("Meeting prompts…", on_settings),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", on_quit),
     )
@@ -633,6 +1095,14 @@ def pump():
                                      payload.get("title", ""), payload.get("new", False))
                 elif kind == "pick_names":
                     pick_transcript_to_name()
+                elif kind == "warm_ask":
+                    show_warm_prompt(payload["title"], payload["start"], payload["end"])
+                elif kind == "call_ask":
+                    show_call_prompt(payload["app"])
+                elif kind == "settings":
+                    show_settings_dialog()
+                elif kind == "end_ask":
+                    show_end_prompt(payload["kind"], payload["rec_id"], payload["old"], payload["new"])
             except Exception as e:
                 # never let one bad dialog kill the pump (and with it every later click)
                 import traceback
@@ -658,12 +1128,14 @@ def pick_and_transcribe():
 
 def main():
     global icon, root
+    load_settings()
     root = tk.Tk()
     root.withdraw()                       # no main window; we live in the tray
     icon = pystray.Icon("meeting_recorder", make_image("idle"), "Meeting recorder — idle", build_menu())
     _shown.update(kind="idle", menu=("idle", status_line()))
     icon.run_detached()                   # tray in its own thread
     root.after(150, pump)                 # tk owns the main thread (dialogs need it)
+    threading.Thread(target=watch_main, daemon=True).start()   # the optional meeting prompts
     root.mainloop()
 
 

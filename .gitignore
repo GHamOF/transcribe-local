@@ -221,6 +221,7 @@ __marimo__/
 
 # transcribe-local runtime files
 tray.heartbeat
+tray-settings.json
 *.wav
 recordings/
 tray.lock

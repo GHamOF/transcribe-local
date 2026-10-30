@@ -1264,6 +1264,24 @@ def transcription_server(progress=None, manage=True, keep_up=False):
                     (progress or print)(f"WARNING: could not stop the server: {e}")
 
 
+def warm_up_server(progress=None):
+    """Start the server ahead of a meeting so its transcript doesn't wait for the
+    bring-up. A server this starts is ours like any other: the next transcription
+    stops it when done, or release_idle_server does if nobody records."""
+    with _srv_lock:
+        start_server(progress)
+
+
+def release_idle_server(progress=None):
+    """Stop a server we started that no transcription is using (a warm-up that
+    never got its recording). Returns True if it was stopped."""
+    with _srv_lock:
+        if _owned and not _srv_users:
+            stop_server(progress, wait=False)
+            return True
+    return False
+
+
 def transcribe_file(wav_path, language=LANGUAGE, diarization=True, expected_speakers=None,
                     mic_gain=MIC_GAIN, progress=None, manage_server=True, keep_server=False):
     """Mix (if stereo), bring the server up if needed, transcribe, take it down

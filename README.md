@@ -145,8 +145,42 @@ Right-click menu (its first line says what the tray is doing):
 - **Name speakers in a transcript…** opens the naming dialog for an older `.txt`.
   Saving writes a fresh inbox copy (`-2`, `-3`, …).
 - **Open transcripts folder**
+- **Meeting prompts…** opens a window with three optional popups, all off until you
+  tick them (saved straight away, in `tray-settings.json`):
+  - *Offer to warm up the server before meetings*: about 2 minutes before a meeting, a
+    popup offers to start the server, so the transcript doesn't wait for it afterwards.
+    Then the server stops after that meeting's transcript, or 10 minutes after the
+    meeting ends if nothing was recorded. Meetings are picked up locally from the new
+    Outlook's reminder notifications, so it needs Outlook running (in the background
+    is enough) and a reminder of at least 3 minutes on the meeting (Outlook's default
+    is 15). A reminder that comes later still gets the popup, up to 5 minutes after
+    the start. Meetings without a reminder get no popup. The server isn't stopped
+    while an app still has the microphone, so a meeting that runs long keeps it.
+  - *Offer to record when an app starts using the mic*: within a minute of any app
+    opening your microphone (Teams, Zoom, a browser call; you answer, or reach a
+    meeting's join screen), a popup offers to start recording. Ringing alone doesn't
+    trigger it. *Never for …* on the popup silences that app (handy for dictation
+    tools); *Ask again* in the Meeting prompts window undoes it. Audio routers (SteelSeries Sonar,
+    NVIDIA Broadcast, Voicemeeter, Krisp) are skipped, since they open the mic on
+    behalf of the app that's really using it.
+  - *Offer to stop when the call ends or changes*: while recording, if the call's app
+    stops using the microphone for a few minutes, *Call ended?* offers *Stop
+    recording*. If it stops and a new call opens the mic (you left one call and
+    joined the next), *New call?* offers *Keep recording*, *Stop*, or *Stop and
+    record the new call* (the old recording goes to the title popup, the new one
+    starts straight away). Ignoring either popup keeps recording. Switches are
+    caught even between checks: Windows notes when an app last opened the mic.
+
+  All are checked once a minute. Nothing here stops a recording on its own; only
+  your click does. With all three off, none of these popups appear.
 - **Quit** finishes writing a running recording first, and asks before abandoning a
   running transcription.
+
+The tray's windows (these popups, the transcribe and "who is who?" dialogs) are
+excluded from screen capture: in a Teams/Zoom/browser screen share, OBS or a
+screenshot they don't appear, so the Snipping Tool can't capture them either.
+Windows' own notification balloons can't be excluded, so the tray skips them while
+an app is using the microphone.
 
 Only one tray instance can run; launching it again does nothing. It logs to `tray.log`
 next to the script.
